@@ -1,19 +1,30 @@
 package com.com11h.partner
 
 import android.app.AlertDialog
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.BitmapFactory
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.work.*
@@ -51,8 +62,15 @@ class MainActivity : AppCompatActivity() {
     private val pingHandler = Handler(Looper.getMainLooper())
     private var pingRunnable: Runnable? = null
     private var lastPingSignature: String? = null
+    // Số đơn đang "pending" (chờ Partner xác nhận) ở lần ping gần nhất — dùng
+    // để phát hiện có ĐƠN MỚI thật sự (pending_count TĂNG), tách biệt với
+    // lastPingSignature ở trên (đổi cho MỌI thay đổi pickup, kể cả do chính
+    // Partner bấm Nhận đơn/Báo xong) chỉ dùng để tự làm mới danh sách.
+    private var lastPendingCount: Int? = null
     private val PING_INTERVAL_MS = 8000L
     private val PICK_IMAGE = 9001
+    private val NEW_ORDER_CHANNEL_ID = "partner_new_orders"
+    private val NEW_ORDER_NOTIF_ID = 2001
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
@@ -93,6 +111,7 @@ class MainActivity : AppCompatActivity() {
 
             }
         }
+        createNewOrderNotificationChannel()
         if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf("android.permission.POST_NOTIFICATIONS"), 12)
         }
@@ -118,12 +137,91 @@ class MainActivity : AppCompatActivity() {
         thread {
             try {
                 val j = api.call("partner_ping")
-                val sig = (j.optJSONObject("data") ?: j).toString()
+                val data = j.optJSONObject("data") ?: JSONObject()
+                val sig = data.toString()
                 val changed = lastPingSignature != null && sig != lastPingSignature
                 lastPingSignature = sig
+
+                // 🔔 ĐƠN HÀNG MỚI: chỉ rung chuông + phát âm thanh khi pending_count
+                // THẬT SỰ TĂNG so với lần ping trước (đơn mới vừa được Admin xác nhận
+                // và đưa vào chờ Partner). Không dùng "changed" ở trên vì nó đổi cho
+                // mọi thao tác (kể cả chính Partner bấm Nhận đơn/Báo xong), sẽ báo nhầm.
+                val pendingCount = data.optInt("pending_count", -1)
+                if (pendingCount >= 0) {
+                    val prev = lastPendingCount
+                    if (prev != null && pendingCount > prev) {
+                        runOnUiThread { notifyNewOrder(pendingCount) }
+                    }
+                    lastPendingCount = pendingCount
+                }
+
                 if (changed) runOnUiThread { syncPending() }
             } catch (_: UnauthorizedException) { runOnUiThread { logout() } }
             catch (_: Exception) { }
+        }
+    }
+
+    /** Tạo kênh thông báo "Đơn hàng mới" (âm thanh + rung) — cần gọi trước khi notify trên Android 8+. */
+    private fun createNewOrderNotificationChannel() {
+        if (Build.VERSION.SDK_INT < 26) return
+        val pattern = longArrayOf(0, 400, 200, 400)
+        val channel = NotificationChannel(NEW_ORDER_CHANNEL_ID, "Đơn hàng mới", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Thông báo khi có đơn hàng mới cần xác nhận"
+            enableVibration(true)
+            vibrationPattern = pattern
+            enableLights(true)
+            val audioAttrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_NOTIFICATION_EVENT)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION), audioAttrs)
+        }
+        getSystemService(NotificationManager::class.java)?.createNotificationChannel(channel)
+    }
+
+    /** 🔔 ĐƠN HÀNG MỚI — hiện thông báo hệ thống + rung + phát âm thanh (kể cả khi app đang mở). */
+    private fun notifyNewOrder(pendingCount: Int) {
+        vibrateNewOrder()
+        playNewOrderSound()
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) return
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or (if (Build.VERSION.SDK_INT >= 23) PendingIntent.FLAG_IMMUTABLE else 0)
+        val contentIntent = PendingIntent.getActivity(this, 0, openIntent, flags)
+        val notif = NotificationCompat.Builder(this, NEW_ORDER_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("🔔 ĐƠN HÀNG MỚI")
+            .setContentText(if (pendingCount > 1) "Có $pendingCount đơn mới cần xác nhận" else "Có đơn mới cần xác nhận")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_ALARM)
+            .setAutoCancel(true)
+            .setContentIntent(contentIntent)
+            .setVibrate(longArrayOf(0, 400, 200, 400))
+            .build()
+        runCatching { NotificationManagerCompat.from(this).notify(NEW_ORDER_NOTIF_ID, notif) }
+    }
+
+    private fun vibrateNewOrder() {
+        val pattern = longArrayOf(0, 400, 200, 400)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 31) {
+                val vm = getSystemService(VibratorManager::class.java)
+                vm?.defaultVibrator?.vibrate(VibrationEffect.createWaveform(pattern, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                val v = getSystemService(VIBRATOR_SERVICE) as? Vibrator
+                if (Build.VERSION.SDK_INT >= 26) v?.vibrate(VibrationEffect.createWaveform(pattern, -1))
+                else @Suppress("DEPRECATION") v?.vibrate(pattern, -1)
+            }
+        }
+    }
+
+    private fun playNewOrderSound() {
+        runCatching {
+            val uri = RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_NOTIFICATION)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            RingtoneManager.getRingtone(this, uri)?.play()
         }
     }
 
@@ -214,6 +312,7 @@ class MainActivity : AppCompatActivity() {
         stopFastPolling()
         if (::api.isInitialized) thread { runCatching { api.call("partner_logout", JSONObject()) } }
         session.clear(); content.removeAllViews()
+        lastPingSignature = null; lastPendingCount = null
         loginPanel.visibility = LinearLayout.VISIBLE; appPanel.visibility = LinearLayout.GONE
         loginStatus.text = "Đã đăng xuất"
     }

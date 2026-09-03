@@ -376,6 +376,15 @@ class MainActivity : AppCompatActivity() {
         } else if (st == "confirmed" || st == "preparing") {
             val ready = Button(this).apply { text = "🍱 Món đã xong — báo Shipper" }; c.addView(ready)
             ready.setOnClickListener { action(id, "partner_mark_ready") { loadPickups("partner_pickups", "preparing") } }
+        } else if (st == "ready" || st == "rejected" || st == "picked_up") {
+            // Mục "Lịch sử": pickup đã xong việc với tiệm — cho phép Partner tự
+            // dọn bớt khỏi màn hình của mình (ẩn, không xoá dữ liệu thật — xem
+            // partner_hide_pickup() ở core.php).
+            val del = Button(this).apply { text = "🗑️ Xoá khỏi lịch sử" }; c.addView(del)
+            del.setOnClickListener {
+                del.isEnabled = false
+                action(id, "partner_hide_pickup") { loadPickups("partner_pickups", "ready,rejected") }
+            }
         }
         content.addView(c)
     }
